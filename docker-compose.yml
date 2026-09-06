@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: clarity
+      POSTGRES_PASSWORD: clarity
+      POSTGRES_DB: clarity_mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      - clarity_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clarity -d clarity_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://clarity:clarity@db:5432/clarity_mcp
+      CLARITY_API_TOKEN: ${CLARITY_API_TOKEN:?set CLARITY_API_TOKEN in your shell or .env}
+      MCP_BRIDGE_SECRET: ${MCP_BRIDGE_SECRET:?set MCP_BRIDGE_SECRET in your shell or .env}
+      CLARITY_CACHE_TTL_MS: ${CLARITY_CACHE_TTL_MS:-21600000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  clarity_pgdata:

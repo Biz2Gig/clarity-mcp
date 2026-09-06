@@ -1,0 +1,14 @@
+node_modules
+/build
+/.react-router
+.cache
+
+# secrets / local env
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+/prisma/*.db
+/prisma/*.db-journal

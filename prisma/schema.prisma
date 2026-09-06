@@ -1,0 +1,45 @@
+// Prisma schema for clarity-mcp.
+// Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Latest Clarity response per (numOfDays + dimensions) combination.
+/// `key` looks like "3::OS|Country/Region" (numOfDays "::" pipe-joined dims).
+model InsightsCache {
+  key        String   @id
+  numOfDays  Int
+  dimensions String // comma-joined dimension names, "" when none
+  payload    Json
+  fetchedAt  DateTime
+  updatedAt  DateTime @updatedAt
+}
+
+/// Append-only history of every live response, so the server can answer
+/// ranges wider than Clarity's rolling 1-3 day window from local data.
+model InsightsSnapshot {
+  id         Int      @id @default(autoincrement())
+  key        String
+  numOfDays  Int
+  dimensions String
+  payload    Json
+  fetchedAt  DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([key, fetchedAt])
+  @@index([fetchedAt])
+}
+
+/// One row per UTC day. Tracks usage against Clarity's hard limit of
+/// 10 API calls per project per day.
+model ApiCallLog {
+  day       String   @id // "YYYY-MM-DD" in UTC
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
+}
