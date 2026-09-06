@@ -1,5 +1,9 @@
 // Prisma schema for clarity-mcp.
 // Learn more: https://pris.ly/d/prisma-schema
+//
+// All DateTime columns are `timestamptz` so that comparisons against SQL
+// `now()` and JS `Date` parameters are timezone-safe regardless of the
+// database server's local time zone.
 
 generator client {
   provider = "prisma-client-js"
@@ -10,6 +14,10 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ---------------------------------------------------------------------------
+// Clarity aggregate analytics (existing)
+// ---------------------------------------------------------------------------
+
 /// Latest Clarity response per (numOfDays + dimensions) combination.
 /// `key` looks like "3::OS|Country/Region" (numOfDays "::" pipe-joined dims).
 model InsightsCache {
@@ -17,29 +25,226 @@ model InsightsCache {
   numOfDays  Int
   dimensions String // comma-joined dimension names, "" when none
   payload    Json
-  fetchedAt  DateTime
-  updatedAt  DateTime @updatedAt
+  fetchedAt  DateTime @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
 }
 
-/// Append-only history of every live response, so the server can answer
-/// ranges wider than Clarity's rolling 1-3 day window from local data.
+/// Append-only history of live responses. Each row is a snapshot of a
+/// ROLLING aggregate window (last 1-3 days as of `fetchedAt`), NOT additive
+/// per-day data. Overlapping snapshots must not be summed.
 model InsightsSnapshot {
   id         Int      @id @default(autoincrement())
   key        String
   numOfDays  Int
   dimensions String
   payload    Json
-  fetchedAt  DateTime
-  createdAt  DateTime @default(now())
+  fetchedAt  DateTime @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
 
   @@index([key, fetchedAt])
   @@index([fetchedAt])
 }
 
 /// One row per UTC day. Tracks usage against Clarity's hard limit of
-/// 10 API calls per project per day.
+/// 10 API calls per project per day. Reservation is done with an atomic
+/// conditional UPDATE (see app/clarity.server.ts) so concurrent refreshes
+/// cannot exceed the allowance.
 model ApiCallLog {
   day       String   @id // "YYYY-MM-DD" in UTC
   count     Int      @default(0)
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
+
+// ---------------------------------------------------------------------------
+// Clarity recording metadata (imported from dashboard CSV export)
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single Clarity session recording, imported from the CSV
+/// a user exports from the Clarity dashboard. This is METADATA ONLY - the
+/// Data Export API does not expose replay data, so `recordingUrl` is the
+/// dashboard link, not a downloadable media file.
+model ClarityRecording {
+  id            String    @id @default(cuid())
+  recordingUrl  String?
+  sessionId     String?
+  clarityUserId String?
+  startTime     DateTime? @db.Timestamptz(3)
+  durationMs    Int?
+  entryUrl      String?
+  exitUrl       String?
+  referrer      String?
+  device        String?
+  browser       String?
+  os            String?
+  country       String?
+  pageCount     Int?
+  clickCount    Int?
+  rageClicks    Int?
+  deadClicks    Int?
+  scriptErrors  Int?
+  /// recordingUrl, else sessionId, else sha256 of the normalized raw row.
+  dedupeKey     String    @unique
+  /// The complete original CSV row, header -> value.
+  raw           Json
+  importedAt    DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([startTime])
+  @@index([entryUrl])
+  @@index([exitUrl])
+  @@index([device])
+  @@index([browser])
+  @@index([country])
+  @@index([sessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Video ingestion + analysis
+// ---------------------------------------------------------------------------
+
+enum VideoStatus {
+  queued
+  processing
+  completed
+  failed
+}
+
+/// Fine-grained processing stage, surfaced by get_video_status.
+enum JobStage {
+  queued
+  downloading
+  probing
+  extracting_audio
+  transcribing
+  extracting_frames
+  analyzing_frames
+  synthesizing
+  completed
+  failed
+}
+
+model VideoAsset {
+  id             String      @id @default(cuid())
+  title          String?
+  /// Original source URL, retained only when it is not a presigned/credentialed URL.
+  sourceUrl      String?
+  /// Key of the downloaded source file in the storage provider.
+  storageKey     String?
+  mimeType       String?
+  fileSize       Int?
+  durationSec    Float?
+  width          Int?
+  height         Int?
+  fps            Float?
+  /// Requested transcription language hint (BCP-47), optional.
+  language       String?
+  analysisPrompt String?
+  extractVisuals Boolean     @default(true)
+  status         VideoStatus @default(queued)
+  error          String?
+
+  // Provider / model provenance for the completed analysis.
+  sttProvider       String?
+  sttModel          String?
+  visionProvider    String?
+  visionModel       String?
+  synthesisProvider String?
+  synthesisModel    String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  jobs     ProcessingJob[]
+  segments TranscriptSegment[]
+  frames   ExtractedFrame[]
+  analysis VideoAnalysis?
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ProcessingJob {
+  id          String     @id @default(cuid())
+  videoId     String
+  video       VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  kind        String     @default("video_analysis")
+  stage       JobStage   @default(queued)
+  progress    Int        @default(0) // 0..100
+  stepsDone   Int        @default(0)
+  stepsTotal  Int        @default(8)
+  error       String?
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(3)
+  /// Worker identifier that currently holds the job lock.
+  lockedBy    String?
+  lockedAt    DateTime?  @db.Timestamptz(3)
+  /// Job is not eligible to run before this time (retry backoff).
+  runAfter    DateTime   @default(now()) @db.Timestamptz(3)
+  startedAt   DateTime?  @db.Timestamptz(3)
+  finishedAt  DateTime?  @db.Timestamptz(3)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(3)
+
+  @@index([stage, runAfter])
+  @@index([lockedAt])
+  @@index([videoId])
+}
+
+model TranscriptSegment {
+  id         String     @id @default(cuid())
+  videoId    String
+  video      VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  idx        Int
+  startMs    Int
+  endMs      Int
+  text       String
+  speaker    String?
+  confidence Float?
+  createdAt  DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@unique([videoId, idx])
+  @@index([videoId, startMs])
+}
+
+model ExtractedFrame {
+  id          String     @id @default(cuid())
+  videoId     String
+  video       VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  idx         Int
+  timestampMs Int
+  storageKey  String
+  width       Int?
+  height      Int?
+  sceneChange Boolean    @default(false)
+  /// Vision-provider description of the frame.
+  description String?
+  ocrText     String?
+  /// Vision-provider structured detections (objects / UI / products).
+  objects     Json?
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@unique([videoId, idx])
+  @@index([videoId, timestampMs])
+}
+
+model VideoAnalysis {
+  id                String     @id @default(cuid())
+  videoId           String     @unique
+  video             VideoAsset @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  executiveSummary  String
+  fullDescription   String
+  transcriptSummary String
+  importantEvents   Json // [{ timestampMs, description }]
+  visibleText       Json // [{ timestampMs, text }]
+  detectedObjects   Json // [{ label, timestampsMs: number[] }]
+  problems          Json // [{ description, timestampsMs: number[] }]
+  recommendations   Json // string[]
+  citations         Json // [{ claim, timestampsMs: number[] }]
+  compact           Json?
+  detailed          Json?
+  raw               Json?
+  provider          String
+  model             String
+  createdAt         DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @db.Timestamptz(3)
 }

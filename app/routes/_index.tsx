@@ -3,7 +3,13 @@ export function loader() {
     ok: true,
     service: "clarity-mcp",
     endpoint: "/mcp",
-    transport: "JSON-RPC 2.0 over HTTP POST",
+    transport: "Streamable HTTP (JSON-RPC 2.0), stateless JSON mode",
+    capabilities: [
+      "Clarity aggregate analytics (cached, 10 calls/day)",
+      "Clarity recording metadata import from dashboard CSV",
+      "Async video ingestion, transcription, keyframe + visual analysis",
+      "Timestamp-grounded video summaries and Q&A",
+    ],
   };
 }
 
@@ -12,27 +18,30 @@ export default function Index() {
     <main
       style={{
         fontFamily: "system-ui, sans-serif",
-        lineHeight: 1.5,
+        lineHeight: 1.55,
         padding: "2rem",
-        maxWidth: 680,
+        maxWidth: 720,
       }}
     >
       <h1>clarity-mcp</h1>
       <p>
-        An MCP bridge for the{" "}
+        MCP server for the{" "}
         <a href="https://learn.microsoft.com/en-us/clarity/setup-and-installation/clarity-data-export-api">
           Microsoft Clarity Data Export API
         </a>
-        .
+        , Clarity recording-metadata import, and asynchronous video analysis.
       </p>
       <p>
-        JSON-RPC endpoint: <code>POST /mcp</code> with header{" "}
-        <code>Authorization: Bearer &lt;MCP_BRIDGE_SECRET&gt;</code>.
+        JSON-RPC endpoint: <code>POST /mcp</code> with{" "}
+        <code>Authorization: Bearer &lt;MCP_BRIDGE_SECRET&gt;</code>. Protocol
+        version is negotiated by the MCP SDK.
       </p>
       <p>
-        Responses are cached and the upstream 10-calls-per-day limit is tracked;
-        see <code>clarity_quota_status</code>.
+        Clarity session <em>replays</em> are not retrievable through the Data
+        Export API. Recording tools import <strong>metadata only</strong> from
+        the CSV you export in the Clarity dashboard.
       </p>
+      <p>See the README for setup, worker, and tool documentation.</p>
     </main>
   );
 }

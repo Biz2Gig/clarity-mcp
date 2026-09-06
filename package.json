@@ -1,5 +1,6 @@
 {
   "name": "clarity-mcp",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,27 +10,44 @@
     "dev": "react-router dev",
     "build": "react-router build",
     "start": "react-router-serve ./build/server/index.js",
+    "worker": "tsx app/worker.ts",
+    "worker:dev": "tsx watch app/worker.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "node scripts/with-embedded-pg.mjs test",
     "setup": "prisma generate && prisma migrate deploy",
-    "docker-start": "npm run setup && npm run start",
+    "docker-start": "prisma migrate deploy && react-router-serve ./build/server/index.js",
+    "docker-worker": "prisma migrate deploy && tsx app/worker.ts",
     "prisma": "prisma",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.2",
     "@prisma/client": "^6.16.3",
     "@react-router/node": "^7.12.0",
     "@react-router/serve": "^7.12.0",
+    "csv-parse": "^5.6.0",
+    "openai": "^4.104.0",
+    "prisma": "^6.16.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router": "^7.12.0"
+    "react-router": "^7.12.0",
+    "tsx": "^4.19.2",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@react-router/dev": "^7.12.0",
     "@types/node": "^22.18.8",
     "@types/react": "^18.3.25",
     "@types/react-dom": "^18.3.7",
-    "prisma": "^6.16.3",
+    "embedded-postgres": "^17.5.0-beta.15",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
     "typescript": "^5.9.3",
     "vite": "^6.3.6",
-    "vite-tsconfig-paths": "^5.1.4"
+    "vite-tsconfig-paths": "^5.1.4",
+    "vitest": "^2.1.9"
   }
 }

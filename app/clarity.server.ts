@@ -1,17 +1,12 @@
+import { config } from "./config.server";
 import prisma from "./db.server";
+import { QuotaError, ValidationError } from "./errors";
 
-const CLARITY_API_TOKEN = process.env.CLARITY_API_TOKEN;
 const CLARITY_BASE =
   "https://www.clarity.ms/export-data/api/v1/project-live-insights";
 
 /** Clarity hard limit: API calls per project per UTC day. */
 export const DAILY_LIMIT = 10;
-
-/** How long a cached response is treated as "fresh". Stale cache is still
- *  served without an API call unless the caller forces a refresh. */
-const CACHE_TTL_MS = Number(
-  process.env.CLARITY_CACHE_TTL_MS ?? 6 * 60 * 60 * 1000,
-);
 
 /** Dimensions accepted by project-live-insights (max 3 per request). */
 export const DIMENSIONS = [
@@ -56,19 +51,48 @@ function normalizeDim(d: string | undefined): Dimension | undefined {
     (x) => x.toLowerCase() === String(d).trim().toLowerCase(),
   );
   if (!match) {
-    throw new Error(
+    throw new ValidationError(
       `Invalid dimension "${d}". Valid values: ${DIMENSIONS.join(", ")}`,
     );
   }
   return match;
 }
 
+/**
+ * Normalize + de-duplicate the requested dimensions (fix: prevent duplicate
+ * dimensions in Clarity requests). Order is preserved; a case-insensitive
+ * repeat is dropped. More than 3 distinct dimensions is rejected.
+ */
+export function resolveDimensions(
+  raw: (string | undefined)[],
+): { dimensions: Dimension[]; droppedDuplicates: string[] } {
+  const seen = new Set<string>();
+  const dimensions: Dimension[] = [];
+  const droppedDuplicates: string[] = [];
+  for (const r of raw) {
+    const dim = normalizeDim(r);
+    if (!dim) continue;
+    if (seen.has(dim)) {
+      droppedDuplicates.push(dim);
+      continue;
+    }
+    seen.add(dim);
+    dimensions.push(dim);
+  }
+  if (dimensions.length > 3) {
+    throw new ValidationError(
+      `At most 3 distinct dimensions are allowed (got ${dimensions.length}).`,
+    );
+  }
+  return { dimensions, droppedDuplicates };
+}
+
 function utcDayKey(d = new Date()): string {
   return d.toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
 }
 
-function cacheKey(numOfDays: NumOfDays, dims: (Dimension | undefined)[]): string {
-  return `${numOfDays}::${dims.filter(Boolean).join("|")}`;
+function cacheKey(numOfDays: NumOfDays, dims: Dimension[]): string {
+  return `${numOfDays}::${dims.join("|")}`;
 }
 
 export interface QuotaStatus {
@@ -94,14 +118,34 @@ export async function quotaStatus(): Promise<QuotaStatus> {
   };
 }
 
-async function incrementQuota(): Promise<number> {
+/**
+ * Atomically reserve one slot of today's quota. A single conditional UPSERT
+ * guarantees that concurrent refreshes cannot push `count` past DAILY_LIMIT:
+ * the row is only incremented when it is still below the limit, and the new
+ * value is returned. `ok:false` means the limit was already reached.
+ */
+export async function reserveQuotaSlot(): Promise<{ ok: boolean; count: number }> {
   const day = utcDayKey();
-  const row = await prisma.apiCallLog.upsert({
-    where: { day },
-    create: { day, count: 1 },
-    update: { count: { increment: 1 } },
-  });
-  return row.count;
+  const rows = await prisma.$queryRaw<{ count: number }[]>`
+    INSERT INTO "ApiCallLog" ("day", "count", "updatedAt")
+    VALUES (${day}, 1, now())
+    ON CONFLICT ("day") DO UPDATE
+      SET "count" = "ApiCallLog"."count" + 1, "updatedAt" = now()
+      WHERE "ApiCallLog"."count" < ${DAILY_LIMIT}
+    RETURNING "count"
+  `;
+  return rows.length > 0
+    ? { ok: true, count: Number(rows[0].count) }
+    : { ok: false, count: DAILY_LIMIT };
+}
+
+/** Give back a reserved slot when the API call itself failed. Best effort. */
+export async function releaseQuotaSlot(): Promise<void> {
+  const day = utcDayKey();
+  await prisma.$executeRaw`
+    UPDATE "ApiCallLog" SET "count" = "count" - 1, "updatedAt" = now()
+    WHERE "day" = ${day} AND "count" > 0
+  `;
 }
 
 async function pinQuotaToLimit(): Promise<void> {
@@ -113,17 +157,24 @@ async function pinQuotaToLimit(): Promise<void> {
   });
 }
 
+export interface LiveInsightsMeta {
+  source: "live" | "cache";
+  stale: boolean;
+  ageMs: number | null;
+  asOf: string;
+  cacheTtlMs: number;
+  refreshPolicy: "revalidate" | "stale";
+  numOfDays: NumOfDays;
+  dimensions: Dimension[];
+  droppedDuplicateDimensions: string[];
+  quota: QuotaStatus;
+  /** Present only when returning data that is NOT current. */
+  warning?: string;
+}
+
 export interface LiveInsightsResult {
   data: unknown;
-  meta: {
-    source: "live" | "cache";
-    stale: boolean;
-    fetchedAt: string;
-    cacheTtlMs: number;
-    numOfDays: NumOfDays;
-    dimensions: Dimension[];
-    quota: QuotaStatus;
-  };
+  meta: LiveInsightsMeta;
 }
 
 export interface LiveInsightsOptions {
@@ -131,93 +182,154 @@ export interface LiveInsightsOptions {
   dimension1?: string;
   dimension2?: string;
   dimension3?: string;
-  /** Spend one of the 10 daily API calls even if a cached response exists. */
+  /** Spend one of the 10 daily API calls even if a fresh cache exists. */
   forceRefresh?: boolean;
 }
 
 /**
- * Fetch project-live-insights, cache-first.
+ * Fetch project-live-insights with a documented, quota-safe refresh policy:
  *
- * Quota policy (Clarity allows only 10 live calls / project / day):
- *   - forceRefresh=false (default): serve any cached row (fresh or stale)
- *     without an API call. Only hit the API when nothing is cached for
- *     this exact (numOfDays + dimensions) combination.
- *   - forceRefresh=true: hit the API if quota remains; otherwise fall back
- *     to stale cache, or error if there is none.
+ *   1. Fresh cache (age < CLARITY_CACHE_TTL_MS)  -> returned immediately.
+ *   2. Stale cache + quota remaining:
+ *        - CLARITY_REFRESH_POLICY=revalidate (default): refresh now, return fresh.
+ *        - CLARITY_REFRESH_POLICY=stale: return stale data with an explicit
+ *          `meta.warning`; refresh only on forceRefresh.
+ *   3. Stale cache + quota exhausted -> stale data with an explicit warning.
+ *   4. No cache + quota exhausted    -> QuotaError.
+ *   5. forceRefresh -> always attempts a live call (spends quota) if any remains.
+ *
+ * Stale data is NEVER returned with `meta.stale=false`.
  */
 export async function getLiveInsights(
   opts: LiveInsightsOptions = {},
 ): Promise<LiveInsightsResult> {
-  if (!CLARITY_API_TOKEN) {
-    throw new Error(
+  if (!config.clarityApiToken) {
+    throw new ValidationError(
       "CLARITY_API_TOKEN is not set. Add it to the environment or .env file.",
     );
   }
 
   const numOfDays = clampDays(opts.numOfDays);
-  const dims = [opts.dimension1, opts.dimension2, opts.dimension3].map(
-    normalizeDim,
-  );
-  const dimList = dims.filter((d): d is Dimension => Boolean(d));
-  const key = cacheKey(numOfDays, dims);
+  const { dimensions, droppedDuplicates } = resolveDimensions([
+    opts.dimension1,
+    opts.dimension2,
+    opts.dimension3,
+  ]);
+  const key = cacheKey(numOfDays, dimensions);
+  const ttl = config.clarityCacheTtlMs;
+  const policy = config.clarityRefreshPolicy;
 
   const cached = await prisma.insightsCache.findUnique({ where: { key } });
-  const fresh =
-    !!cached && Date.now() - cached.fetchedAt.getTime() < CACHE_TTL_MS;
+  const ageMs = cached ? Date.now() - cached.fetchedAt.getTime() : null;
+  const fresh = cached != null && ageMs != null && ageMs < ttl;
 
-  const fromCache = (quota: QuotaStatus): LiveInsightsResult => ({
-    data: cached!.payload,
-    meta: {
-      source: "cache",
-      stale: !fresh,
-      fetchedAt: cached!.fetchedAt.toISOString(),
-      cacheTtlMs: CACHE_TTL_MS,
-      numOfDays,
-      dimensions: dimList,
-      quota,
-    },
+  const makeMeta = (
+    over: Partial<LiveInsightsMeta> & Pick<LiveInsightsMeta, "source" | "stale" | "asOf">,
+  ): LiveInsightsMeta => ({
+    ageMs,
+    cacheTtlMs: ttl,
+    refreshPolicy: policy,
+    numOfDays,
+    dimensions,
+    droppedDuplicateDimensions: droppedDuplicates,
+    quota: over.quota as QuotaStatus,
+    ...over,
   });
 
-  // Default path: never spend a call when we already have something cached.
-  if (cached && !opts.forceRefresh) {
-    return fromCache(await quotaStatus());
+  const serveCache = async (warning?: string): Promise<LiveInsightsResult> => ({
+    data: cached!.payload,
+    meta: makeMeta({
+      source: "cache",
+      stale: !fresh,
+      asOf: cached!.fetchedAt.toISOString(),
+      warning: fresh ? undefined : warning,
+      quota: await quotaStatus(),
+    }),
+  });
+
+  // 1. Fresh cache and not explicitly forced.
+  if (cached && fresh && !opts.forceRefresh) {
+    return serveCache();
   }
 
-  const quota = await quotaStatus();
-  if (quota.remaining <= 0) {
-    if (cached) return fromCache(quota);
-    throw new Error(
-      `Clarity daily API limit reached (${quota.used}/${quota.limit} for ` +
-        `${quota.day} UTC) and nothing is cached for "${key}". ` +
-        `The limit resets at ${quota.resetsAt}.`,
+  // Decide whether a live call should be attempted.
+  const wantLive =
+    opts.forceRefresh === true ||
+    !cached ||
+    (!fresh && policy === "revalidate");
+
+  if (!wantLive && cached) {
+    // Stale, policy=stale, not forced.
+    return serveCache(
+      `Served STALE cache (age ${Math.round((ageMs ?? 0) / 1000)}s). ` +
+        `CLARITY_REFRESH_POLICY=stale, so it was not auto-refreshed. ` +
+        `Pass forceRefresh:true to spend one of the ${DAILY_LIMIT} daily API calls.`,
+    );
+  }
+
+  // 2/3/4. Try to reserve a quota slot atomically.
+  const reservation = await reserveQuotaSlot();
+  if (!reservation.ok) {
+    const q = await quotaStatus();
+    if (cached) {
+      return serveCache(
+        `Served STALE cache (age ${Math.round((ageMs ?? 0) / 1000)}s). ` +
+          `Clarity daily API quota is exhausted (${q.used}/${q.limit}); ` +
+          `it resets at ${q.resetsAt}.`,
+      );
+    }
+    throw new QuotaError(
+      `Clarity daily API limit reached (${q.used}/${q.limit} for ${q.day} UTC) ` +
+        `and nothing is cached for "${key}". Resets at ${q.resetsAt}.`,
     );
   }
 
   const url = new URL(CLARITY_BASE);
   url.searchParams.set("numOfDays", String(numOfDays));
-  dims.forEach((d, i) => {
-    if (d) url.searchParams.set(`dimension${i + 1}`, d);
-  });
+  dimensions.forEach((d, i) => url.searchParams.set(`dimension${i + 1}`, d));
 
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${CLARITY_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  await incrementQuota();
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${config.clarityApiToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+  } catch (e) {
+    await releaseQuotaSlot();
+    if (cached) {
+      return serveCache(
+        `Served STALE cache: the Clarity API request failed (${
+          e instanceof Error ? e.message : String(e)
+        }).`,
+      );
+    }
+    throw e;
+  }
 
   if (!res.ok) {
     if (res.status === 429) {
       await pinQuotaToLimit();
-      if (cached) return fromCache(await quotaStatus());
-      throw new Error(
+      if (cached) {
+        return serveCache(
+          "Served STALE cache: Clarity returned 429 (daily limit exceeded).",
+        );
+      }
+      throw new QuotaError(
         "Clarity returned 429 (daily limit exceeded) and no cache is available.",
       );
     }
+    await releaseQuotaSlot();
     const body = await res.text().catch(() => "");
+    if (cached) {
+      return serveCache(
+        `Served STALE cache: Clarity API error ${res.status}${
+          body ? ` - ${body.slice(0, 200)}` : ""
+        }.`,
+      );
+    }
     throw new Error(
       `Clarity API error ${res.status}${body ? `: ${body.slice(0, 300)}` : ""}`,
     );
@@ -225,28 +337,43 @@ export async function getLiveInsights(
 
   const payload = (await res.json()) as unknown;
   const fetchedAt = new Date();
-  const dimensions = dimList.join(",");
+  const dimensionsCsv = dimensions.join(",");
 
   await prisma.insightsCache.upsert({
     where: { key },
-    create: { key, numOfDays, dimensions, payload: payload as object, fetchedAt },
-    update: { numOfDays, dimensions, payload: payload as object, fetchedAt },
+    create: {
+      key,
+      numOfDays,
+      dimensions: dimensionsCsv,
+      payload: payload as object,
+      fetchedAt,
+    },
+    update: {
+      numOfDays,
+      dimensions: dimensionsCsv,
+      payload: payload as object,
+      fetchedAt,
+    },
   });
   await prisma.insightsSnapshot.create({
-    data: { key, numOfDays, dimensions, payload: payload as object, fetchedAt },
+    data: {
+      key,
+      numOfDays,
+      dimensions: dimensionsCsv,
+      payload: payload as object,
+      fetchedAt,
+    },
   });
 
   return {
     data: payload,
-    meta: {
+    meta: makeMeta({
       source: "live",
       stale: false,
-      fetchedAt: fetchedAt.toISOString(),
-      cacheTtlMs: CACHE_TTL_MS,
-      numOfDays,
-      dimensions: dimList,
+      asOf: fetchedAt.toISOString(),
+      ageMs: 0,
       quota: await quotaStatus(),
-    },
+    }),
   };
 }
 
@@ -272,11 +399,15 @@ export interface HistoryOptions {
   limit?: number;
 }
 
-/** Read locally stored snapshots. Never calls the Clarity API. */
+/**
+ * Read locally stored snapshots. Never calls the Clarity API.
+ *
+ * IMPORTANT: each snapshot is a ROLLING aggregate window (the last 1-3 days as
+ * of `fetchedAt`). Successive snapshots overlap heavily - they are point-in-
+ * time captures, NOT additive per-day buckets. Do not sum them.
+ */
 export async function getHistory(opts: HistoryOptions = {}) {
-  const where: {
-    fetchedAt?: { gte?: Date; lte?: Date };
-  } = {};
+  const where: { fetchedAt?: { gte?: Date; lte?: Date } } = {};
   if (opts.from || opts.to) {
     where.fetchedAt = {};
     if (opts.from) where.fetchedAt.gte = new Date(opts.from);
@@ -289,16 +420,23 @@ export async function getHistory(opts: HistoryOptions = {}) {
     take: Math.min(Math.max(Number(opts.limit ?? 50), 1), 500),
   });
 
+  const note =
+    "Each snapshot is a rolling 1-3 day aggregate window as of `fetchedAt`. " +
+    "Snapshots overlap; do not sum them as daily data.";
+
   if (!opts.metricName) {
-    return rows.map(({ payload: _payload, ...rest }) => rest);
+    return { note, snapshots: rows.map(({ payload: _p, ...rest }) => rest) };
   }
 
-  return rows.map((r) => ({
-    id: r.id,
-    key: r.key,
-    numOfDays: r.numOfDays,
-    dimensions: r.dimensions,
-    fetchedAt: r.fetchedAt,
-    metric: pickMetric(r.payload, opts.metricName as string),
-  }));
+  return {
+    note,
+    snapshots: rows.map((r) => ({
+      id: r.id,
+      key: r.key,
+      numOfDays: r.numOfDays,
+      dimensions: r.dimensions,
+      fetchedAt: r.fetchedAt,
+      metric: pickMetric(r.payload, opts.metricName as string),
+    })),
+  };
 }

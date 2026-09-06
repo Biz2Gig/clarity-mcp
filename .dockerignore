@@ -1,0 +1,14 @@
+node_modules
+build
+.react-router
+storage
+coverage
+.git
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+.DS_Store
+tests
+scripts/with-embedded-pg.mjs

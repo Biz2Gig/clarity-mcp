@@ -17,16 +17,48 @@ services:
 
   app:
     build: .
+    command: npm run docker-start
     environment:
       DATABASE_URL: postgresql://clarity:clarity@db:5432/clarity_mcp
-      CLARITY_API_TOKEN: ${CLARITY_API_TOKEN:?set CLARITY_API_TOKEN in your shell or .env}
       MCP_BRIDGE_SECRET: ${MCP_BRIDGE_SECRET:?set MCP_BRIDGE_SECRET in your shell or .env}
+      CLARITY_API_TOKEN: ${CLARITY_API_TOKEN:?set CLARITY_API_TOKEN in your shell or .env}
       CLARITY_CACHE_TTL_MS: ${CLARITY_CACHE_TTL_MS:-21600000}
+      CLARITY_REFRESH_POLICY: ${CLARITY_REFRESH_POLICY:-revalidate}
+      STORAGE_DIR: /data/storage
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      VIDEO_MAX_BYTES: ${VIDEO_MAX_BYTES:-524288000}
     ports:
       - "3000:3000"
+    volumes:
+      - clarity_storage:/data/storage
     depends_on:
       db:
         condition: service_healthy
 
+  worker:
+    build: .
+    command: npm run docker-worker
+    environment:
+      DATABASE_URL: postgresql://clarity:clarity@db:5432/clarity_mcp
+      STORAGE_DIR: /data/storage
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      STT_PROVIDER: ${STT_PROVIDER:-openai}
+      VISION_PROVIDER: ${VISION_PROVIDER:-openai}
+      SYNTHESIS_PROVIDER: ${SYNTHESIS_PROVIDER:-openai}
+      VIDEO_MAX_BYTES: ${VIDEO_MAX_BYTES:-524288000}
+      VIDEO_MAX_DURATION_SEC: ${VIDEO_MAX_DURATION_SEC:-10800}
+      VIDEO_KEYFRAME_INTERVAL_SEC: ${VIDEO_KEYFRAME_INTERVAL_SEC:-15}
+      VIDEO_MAX_KEYFRAMES: ${VIDEO_MAX_KEYFRAMES:-120}
+      WORKER_ID: worker-1
+    volumes:
+      - clarity_storage:/data/storage
+    depends_on:
+      db:
+        condition: service_healthy
+    # Scale with:  docker compose up --scale worker=3
+    # (each worker claims jobs with FOR UPDATE SKIP LOCKED)
+
 volumes:
   clarity_pgdata:
+  clarity_storage:
